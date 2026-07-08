@@ -20,20 +20,32 @@ import { larkLogger } from '../core/lark-logger';
 import { sendCardFeishu, sendMessageFeishu, updateCardFeishu } from '../messaging/outbound/send';
 
 const log = larkLogger('channel/interactive-dispatch');
+const FEISHU_INTERACTIVE_DEDUPE_TTL_MS = 10 * 60 * 1000;
+const FEISHU_INTERACTIVE_DEDUPE_MAX_ENTRIES = 4096;
+const handledInteractiveDedupe = new Map<string, { expiresAt: number }>();
+
+export function clearFeishuPluginInteractiveDedupeForTest(): void {
+  handledInteractiveDedupe.clear();
+}
 
 interface FeishuCardActionTriggerEvent {
+  event_id?: string;
+  eventId?: string;
   operator?: { open_id?: string; user_id?: string };
   open_chat_id?: string;
   open_message_id?: string;
   context?: { open_chat_id?: string; open_message_id?: string };
-  action?: { name?: string; value?: { action?: string } };
+  action?: { name?: string; value?: { action?: string }; form_value?: unknown };
+  form_value?: unknown;
 }
 
 function extractBasics(data: unknown): {
   action: string;
+  eventId?: string;
   senderOpenId?: string;
   openChatId?: string;
   openMessageId?: string;
+  actionFingerprint: string;
 } | null {
   try {
     const ev = data as FeishuCardActionTriggerEvent;
@@ -43,9 +55,14 @@ function extractBasics(data: unknown): {
     const openMessageId = ev.open_message_id ?? ev.context?.open_message_id;
     return {
       action: action.trim(),
+      eventId: ev.event_id ?? ev.eventId,
       senderOpenId: resolveCardCallbackOperatorId(ev.operator),
       openChatId,
       openMessageId,
+      actionFingerprint: stableStringify({
+        value: ev.action?.value,
+        form_value: ev.action?.form_value ?? ev.form_value,
+      }),
     };
   } catch {
     return null;
@@ -186,10 +203,12 @@ export async function dispatchFeishuPluginInteractiveHandler(params: {
   };
 
   try {
-    const dedupeId = `feishu:${params.accountId}:${basics.openChatId ?? '-'}:${basics.openMessageId ?? '-'}:${
-      basics.senderOpenId ?? '-'
-    }:${basics.action}`;
+    const dedupeId = buildInteractiveDedupeId(params.accountId, basics);
+    if (hasActiveInteractiveDedupe(dedupeId)) {
+      return undefined;
+    }
 
+    let dedupeClaimed = false;
     let cardResponse: FeishuInteractiveHandlerResponse | undefined;
     const result = await dispatchPluginInteractiveHandler<{
       channel: 'feishu';
@@ -200,12 +219,15 @@ export async function dispatchFeishuPluginInteractiveHandler(params: {
     }>({
       channel: 'feishu',
       data: basics.action,
-      dedupeId,
       invoke: async (match: {
         registration: { handler: (ctx: FeishuInteractiveHandlerContext) => Promise<unknown> | unknown };
         namespace: string;
         payload: string;
       }) => {
+        if (!claimInteractiveDedupe(dedupeId)) {
+          return { handled: false };
+        }
+        dedupeClaimed = true;
         const { registration, namespace, payload } = match;
         const handlerCtx: FeishuInteractiveHandlerContext = {
           channel: 'feishu',
@@ -220,8 +242,12 @@ export async function dispatchFeishuPluginInteractiveHandler(params: {
           respond,
         };
         cardResponse = await registration.handler(handlerCtx);
-        // If the handler returns a card response, treat it as handled.
-        return { handled: cardResponse !== undefined };
+        if (isUnhandledInteractiveResponse(cardResponse)) {
+          releaseInteractiveDedupe(dedupeId);
+          dedupeClaimed = false;
+          return { handled: false };
+        }
+        return { handled: true };
       },
     });
 
@@ -229,8 +255,17 @@ export async function dispatchFeishuPluginInteractiveHandler(params: {
       `interactive dispatch result: action=${basics.action}, matched=${result.matched}, handled=${result.handled}`,
     );
     if (!result.matched) return undefined;
+    if (!result.handled || isUnhandledInteractiveResponse(cardResponse)) {
+      if (dedupeClaimed) {
+        releaseInteractiveDedupe(dedupeId);
+      }
+      return undefined;
+    }
+    markInteractiveDedupeHandled(dedupeId);
+    if (isEmptyObject(cardResponse)) return undefined;
     return cardResponse;
   } catch (err) {
+    releaseInteractiveDedupe(buildInteractiveDedupeId(params.accountId, basics));
     log.warn(`interactive dispatch failed: ${String(err)}`);
     return {
       toast: {
@@ -238,5 +273,99 @@ export async function dispatchFeishuPluginInteractiveHandler(params: {
         content: '交互处理失败，请稍后重试',
       },
     };
+  }
+}
+
+function isUnhandledInteractiveResponse(value: unknown): boolean {
+  if (value === undefined) return true;
+  return Boolean(value)
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && (value as { handled?: unknown }).handled === false;
+}
+
+function isEmptyObject(value: unknown): boolean {
+  return Boolean(value)
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && Object.keys(value as Record<string, unknown>).length === 0;
+}
+
+function buildInteractiveDedupeId(accountId: string, basics: {
+  action: string;
+  eventId?: string;
+  senderOpenId?: string;
+  openChatId?: string;
+  openMessageId?: string;
+  actionFingerprint: string;
+}): string {
+  const eventOrAction = basics.eventId
+    ? `event:${basics.eventId}`
+    : `action:${basics.action}:${basics.actionFingerprint}`;
+  return `feishu:${accountId}:${basics.openChatId ?? '-'}:${basics.openMessageId ?? '-'}:${
+    basics.senderOpenId ?? '-'
+  }:${eventOrAction}`;
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => `${JSON.stringify(key)}:${stableStringify(child)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function hasActiveInteractiveDedupe(dedupeId: string): boolean {
+  const now = Date.now();
+  pruneInteractiveDedupe(now);
+  const entry = handledInteractiveDedupe.get(dedupeId);
+  if (!entry) return false;
+  if (entry.expiresAt <= now) {
+    handledInteractiveDedupe.delete(dedupeId);
+    return false;
+  }
+  return true;
+}
+
+function claimInteractiveDedupe(dedupeId: string): boolean {
+  if (hasActiveInteractiveDedupe(dedupeId)) {
+    return false;
+  }
+  setInteractiveDedupe(dedupeId, Date.now());
+  return true;
+}
+
+function markInteractiveDedupeHandled(dedupeId: string): void {
+  setInteractiveDedupe(dedupeId, Date.now());
+}
+
+function releaseInteractiveDedupe(dedupeId: string): void {
+  handledInteractiveDedupe.delete(dedupeId);
+}
+
+function setInteractiveDedupe(dedupeId: string, now: number): void {
+  pruneInteractiveDedupe(now);
+  if (!handledInteractiveDedupe.has(dedupeId)) {
+    while (handledInteractiveDedupe.size >= FEISHU_INTERACTIVE_DEDUPE_MAX_ENTRIES) {
+      const oldest = handledInteractiveDedupe.keys().next().value as string | undefined;
+      if (!oldest) break;
+      handledInteractiveDedupe.delete(oldest);
+    }
+  }
+  handledInteractiveDedupe.set(dedupeId, {
+    expiresAt: now + FEISHU_INTERACTIVE_DEDUPE_TTL_MS,
+  });
+}
+
+function pruneInteractiveDedupe(now: number): void {
+  for (const [key, entry] of handledInteractiveDedupe) {
+    if (entry.expiresAt <= now) {
+      handledInteractiveDedupe.delete(key);
+    }
   }
 }
