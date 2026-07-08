@@ -205,6 +205,25 @@ describe('AskUserQuestion card callback', () => {
       expect(result).toBeUndefined();
     });
 
+    it('does not consume non-ask-user form submit actions from other plugins', () => {
+      const event = {
+        operator: { open_id: TEST_SENDER },
+        open_chat_id: TEST_CHAT_ID,
+        action: {
+          tag: 'button',
+          name: 'example_form.submit',
+          form_value: {
+            field_a: 'alpha',
+            field_b: 'beta',
+          },
+        },
+      };
+
+      const result = handleAskUserAction(event, createMockCfg(), TEST_ACCOUNT_ID);
+
+      expect(result).toBeUndefined();
+    });
+
     it('returns expired toast for unknown questionId', () => {
       const event = createFormSubmitEvent('non-existent-id', { selection_0: '苹果' });
       const result = handleAskUserAction(event, createMockCfg(), TEST_ACCOUNT_ID) as any;
